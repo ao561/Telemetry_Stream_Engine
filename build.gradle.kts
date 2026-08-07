@@ -85,7 +85,15 @@ protobuf {
 }
 
 application {
-    mainClass.set("com.telemetry.stream.ApplicationKt")
+    mainClass.set("com.telemetry.stream.MainKt")
+}
+
+// Load generator: streams synthetic cluster telemetry at a running server.
+tasks.register<JavaExec>("mockCluster") {
+    group = "application"
+    description = "Streams a simulated microservice cluster at localhost:50051."
+    mainClass.set("com.telemetry.stream.tools.MockClusterGeneratorKt")
+    classpath = sourceSets["main"].runtimeClasspath
 }
 
 // protobuf-gradle-plugin writes its protoc trampoline scripts into build/scripts, which is
