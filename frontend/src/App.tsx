@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Background,
   Controls,
@@ -18,11 +18,13 @@ import {
 import '@xyflow/react/dist/style.css'
 import './App.css'
 
+const API_BASE = 'http://localhost:8080'
 const WS_URL = 'ws://localhost:8080/ws/metrics'
 const RECONNECT_DELAY_MS = 2000
+const OUTAGE_DURATION_MS = 15000
 
 const COLUMN_WIDTH = 260
-const ROW_HEIGHT = 130
+const ROW_HEIGHT = 140
 
 /* ------------------------------------------------------------------ payload */
 
@@ -46,6 +48,11 @@ type DependencyEdgeDto = {
 type GraphTopologyDto = {
   nodes: ServiceNodeDto[]
   edges: DependencyEdgeDto[]
+}
+
+type OutageStateDto = {
+  active: boolean
+  remainingMs: number
 }
 
 /* -------------------------------------------------------------- node model */
@@ -110,17 +117,26 @@ function layout(topology: GraphTopologyDto): Map<string, XYPosition> {
   return positions
 }
 
-function edgeStroke(errorRate: number): string {
-  if (errorRate > 0.15) return '#dc2626'
-  if (errorRate > 0.05) return '#d97706'
-  return '#94a3b8'
+const STATUS_COLOR: Record<Status, string> = {
+  HEALTHY: '#10b981',
+  WARNING: '#f59e0b',
+  CRITICAL: '#ef4444',
 }
+
+function edgeStroke(errorRate: number): string {
+  if (errorRate > 0.15) return '#ef4444'
+  if (errorRate > 0.05) return '#f59e0b'
+  return '#475569'
+}
+
+const ms = (value: number) => `${value.toFixed(1)} ms`
+const pct = (value: number) => `${(value * 100).toFixed(2)}%`
 
 /* --------------------------------------------------------------- node card */
 
-function ServiceCard({ data }: NodeProps<ServiceCardNode>) {
+function ServiceCard({ data, selected }: NodeProps<ServiceCardNode>) {
   return (
-    <div className={`svc-card svc-${data.status.toLowerCase()}`}>
+    <div className={`svc-card svc-${data.status.toLowerCase()}${selected ? ' svc-selected' : ''}`}>
       <Handle type="target" position={Position.Left} />
 
       <div className="svc-header">
@@ -131,7 +147,7 @@ function ServiceCard({ data }: NodeProps<ServiceCardNode>) {
       <dl className="svc-metrics">
         <div>
           <dt>latency</dt>
-          <dd>{data.callCount === 0 ? '--' : `${data.latencyMs.toFixed(1)} ms`}</dd>
+          <dd>{data.callCount === 0 ? '--' : ms(data.latencyMs)}</dd>
         </div>
         <div>
           <dt>blast radius</dt>
@@ -146,39 +162,171 @@ function ServiceCard({ data }: NodeProps<ServiceCardNode>) {
 
 const nodeTypes: NodeTypes = { serviceCard: ServiceCard }
 
+/* ------------------------------------------------------------------ drawer */
+
+type DrawerProps = {
+  topology: GraphTopologyDto
+  serviceId: string
+  onClose: () => void
+}
+
+function ServiceDrawer({ topology, serviceId, onClose }: DrawerProps) {
+  const node = topology.nodes.find((n) => n.serviceId === serviceId)
+  if (!node) return null
+
+  const outbound = topology.edges.filter((e) => e.source === serviceId)
+  const inbound = topology.edges.filter((e) => e.target === serviceId)
+  const stats = outboundStats(serviceId, topology.edges)
+
+  return (
+    <aside className="drawer" aria-label={`Details for ${serviceId}`}>
+      <header className="drawer-head">
+        <div>
+          <h2>{node.serviceId}</h2>
+          <span className={`badge badge-${node.status.toLowerCase()}`}>{node.status}</span>
+        </div>
+        <button className="drawer-close" onClick={onClose} aria-label="Close details">
+          ×
+        </button>
+      </header>
+
+      <section className="drawer-section">
+        <h3>Rolling health</h3>
+        <dl className="drawer-stats">
+          <div>
+            <dt>Latency</dt>
+            <dd>{stats.callCount === 0 ? '--' : ms(stats.latencyMs)}</dd>
+          </div>
+          <div>
+            <dt>Error rate</dt>
+            <dd>{stats.callCount === 0 ? '--' : pct(stats.errorRate)}</dd>
+          </div>
+          <div>
+            <dt>Samples in window</dt>
+            <dd>{stats.callCount}</dd>
+          </div>
+          <div>
+            <dt>Blast radius</dt>
+            <dd>{node.blastRadiusScore}</dd>
+          </div>
+        </dl>
+        {stats.callCount === 0 && (
+          <p className="drawer-note">
+            Leaf service — it makes no outbound calls, so the server reports no latency for it.
+            Its health is inferred by its callers.
+          </p>
+        )}
+      </section>
+
+      <section className="drawer-section">
+        <h3>
+          Depends on <span className="count">{outbound.length}</span>
+        </h3>
+        {outbound.length === 0 ? (
+          <p className="drawer-note">Nothing — this is a leaf.</p>
+        ) : (
+          <ul className="drawer-list">
+            {outbound.map((edge) => (
+              <li key={edge.target}>
+                <span className="peer">{edge.target}</span>
+                <span className="peer-stats">
+                  {ms(edge.avgLatencyMs)} · {pct(edge.avgErrorRate)} · {edge.callCount} calls
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="drawer-section">
+        <h3>
+          Called by <span className="count">{inbound.length}</span>
+        </h3>
+        {inbound.length === 0 ? (
+          <p className="drawer-note">Nothing — this is an entry point.</p>
+        ) : (
+          <ul className="drawer-list">
+            {inbound.map((edge) => (
+              <li key={edge.source}>
+                <span className="peer">{edge.source}</span>
+                <span className="peer-stats">
+                  {ms(edge.avgLatencyMs)} · {pct(edge.avgErrorRate)} · {edge.callCount} calls
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </aside>
+  )
+}
+
 /* --------------------------------------------------------------------- app */
 
 export default function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState<ServiceCardNode>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
+  const [topology, setTopology] = useState<GraphTopologyDto | null>(null)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
   const [connected, setConnected] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
 
+  const [outageEndsAt, setOutageEndsAt] = useState(0)
+  const [outageError, setOutageError] = useState<string | null>(null)
+  const [clock, setClock] = useState(() => Date.now())
+
+  // Drives the outage countdown without re-rendering on every websocket frame.
+  useEffect(() => {
+    const id = setInterval(() => setClock(Date.now()), 250)
+    return () => clearInterval(id)
+  }, [])
+
+  const outageRemainingMs = Math.max(0, outageEndsAt - clock)
+  const outageActive = outageRemainingMs > 0
+
+  const triggerOutage = useCallback(async () => {
+    setOutageError(null)
+    try {
+      const response = await fetch(
+        `${API_BASE}/api/outage?durationMs=${OUTAGE_DURATION_MS}`,
+        { method: 'POST' },
+      )
+      if (!response.ok) throw new Error(`server returned ${response.status}`)
+      const state = (await response.json()) as OutageStateDto
+      setOutageEndsAt(Date.now() + state.remainingMs)
+    } catch (error) {
+      setOutageError(error instanceof Error ? error.message : 'request failed')
+    }
+  }, [])
+
   const applyTopology = useCallback(
-    (topology: GraphTopologyDto) => {
-      const positions = layout(topology)
+    (incoming: GraphTopologyDto) => {
+      setTopology(incoming)
+      const positions = layout(incoming)
 
       setNodes((current) => {
-        // Reuse the position a node already has, so a snapshot every second never
-        // undoes a drag; only nodes seen for the first time get laid out.
-        const placed = new Map(current.map((node) => [node.id, node.position]))
+        // Carry over what React Flow already knows about each node, so a snapshot every
+        // second never undoes a drag or clears the selection ring. Only nodes seen for the
+        // first time get laid out.
+        const existing = new Map(current.map((node) => [node.id, node]))
 
-        return topology.nodes.map((node) => ({
+        return incoming.nodes.map((node) => ({
           id: node.serviceId,
           type: 'serviceCard' as const,
-          position: placed.get(node.serviceId) ??
+          selected: existing.get(node.serviceId)?.selected ?? false,
+          position: existing.get(node.serviceId)?.position ??
             positions.get(node.serviceId) ?? { x: 0, y: 0 },
           data: {
             label: node.serviceId,
             status: node.status,
             blastRadiusScore: node.blastRadiusScore,
-            ...outboundStats(node.serviceId, topology.edges),
+            ...outboundStats(node.serviceId, incoming.edges),
           },
         }))
       })
 
       setEdges(
-        topology.edges.map((edge) => ({
+        incoming.edges.map((edge) => ({
           id: `${edge.source}->${edge.target}`,
           source: edge.source,
           target: edge.target,
@@ -240,36 +388,91 @@ export default function App() {
     }
   }, [])
 
+  const critical = useMemo(
+    () => (topology?.nodes ?? []).filter((n) => n.status === 'CRITICAL').length,
+    [topology],
+  )
+  const warning = useMemo(
+    () => (topology?.nodes ?? []).filter((n) => n.status === 'WARNING').length,
+    [topology],
+  )
+
   return (
     <div className="app">
-      <header className="app-bar">
-        <h1>Telemetry Stream Engine</h1>
-        <div className="app-status">
-          <span className={`dot ${connected ? 'dot-live' : 'dot-down'}`} />
-          {connected ? 'live' : 'reconnecting'}
-          {lastUpdate && <span className="app-stamp">{lastUpdate.toLocaleTimeString()}</span>}
+      <header className="bar">
+        <div className="bar-brand">
+          <span className="bar-mark" />
+          <h1>Telemetry Stream Engine</h1>
+        </div>
+
+        <div className="bar-metrics">
+          <span className="chip">
+            <em>{topology?.nodes.length ?? 0}</em> services
+          </span>
+          <span className={`chip ${warning ? 'chip-warn' : ''}`}>
+            <em>{warning}</em> warning
+          </span>
+          <span className={`chip ${critical ? 'chip-crit' : ''}`}>
+            <em>{critical}</em> critical
+          </span>
+        </div>
+
+        <div className="bar-actions">
+          {outageError && <span className="bar-error">outage failed: {outageError}</span>}
+          <button
+            className={`btn-outage${outageActive ? ' btn-outage-live' : ''}`}
+            onClick={triggerOutage}
+            disabled={outageActive}
+          >
+            {outageActive
+              ? `Outage active · ${(outageRemainingMs / 1000).toFixed(0)}s`
+              : 'Simulate Outage'}
+          </button>
+          <span className="bar-conn">
+            <span className={`dot ${connected ? 'dot-live' : 'dot-down'}`} />
+            {connected ? 'live' : 'reconnecting'}
+            {lastUpdate && <span className="bar-stamp">{lastUpdate.toLocaleTimeString()}</span>}
+          </span>
         </div>
       </header>
 
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        nodeTypes={nodeTypes}
-        fitView
-        proOptions={{ hideAttribution: false }}
-      >
-        <Background />
-        <Controls />
-        <MiniMap pannable zoomable />
-      </ReactFlow>
+      <div className="stage">
+        <ReactFlow
+          colorMode="dark"
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onNodeClick={(_, node) => setSelectedId(node.id)}
+          onPaneClick={() => setSelectedId(null)}
+          nodeTypes={nodeTypes}
+          fitView
+        >
+          <Background gap={22} size={1} color="#1e293b" />
+          <Controls />
+          <MiniMap
+            pannable
+            zoomable
+            nodeColor={(node) => STATUS_COLOR[(node.data as ServiceCardData).status]}
+            maskColor="rgba(8, 12, 20, 0.75)"
+          />
+        </ReactFlow>
 
-      {nodes.length === 0 && (
-        <p className="app-empty">
-          Waiting for topology on {WS_URL} — start the server, then <code>./gradlew mockCluster</code>.
-        </p>
-      )}
+        {topology && selectedId && (
+          <ServiceDrawer
+            topology={topology}
+            serviceId={selectedId}
+            onClose={() => setSelectedId(null)}
+          />
+        )}
+
+        {nodes.length === 0 && (
+          <p className="stage-empty">
+            Waiting for topology on {WS_URL} — start the server, then{' '}
+            <code>./gradlew mockCluster</code>.
+          </p>
+        )}
+      </div>
     </div>
   )
 }

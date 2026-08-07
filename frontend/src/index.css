@@ -1,8 +1,8 @@
 :root {
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   line-height: 1.5;
-  color: #0f172a;
-  background: #f8fafc;
+  color-scheme: dark;
+  background: #080b11;
 }
 
 * { box-sizing: border-box; }

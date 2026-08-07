@@ -65,3 +65,9 @@ fun GraphTopologyResponse.toDto(): GraphTopologyDto = GraphTopologyDto(
     nodes = nodesList.map { it.toDto() },
     edges = edgesList.map { it.toDto() },
 )
+
+@Serializable
+data class OutageStateDto(
+    val active: Boolean,
+    val remainingMs: Long,
+)

@@ -3,13 +3,18 @@ package com.telemetry.stream
 import io.grpc.Server
 import io.grpc.ServerBuilder
 import io.grpc.protobuf.services.ProtoReflectionServiceV1
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.response.respond
+import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
+import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.server.websocket.WebSockets
 import io.ktor.server.websocket.webSocket
@@ -36,6 +41,7 @@ private val WS_KEEPALIVE = 15.seconds
 
 fun main() {
     val telemetry = TelemetryServiceImpl()
+    val outages = OutageController()
     val json = Json { encodeDefaults = true }
 
     val grpcServer: Server = ServerBuilder.forPort(GRPC_PORT)
@@ -66,6 +72,15 @@ fun main() {
     }
 
     val httpServer = embeddedServer(Netty, port = HTTP_PORT) {
+        install(CORS) {
+            // The Vite dev server is a different origin, and fetch (unlike WebSocket) is
+            // subject to CORS. Dev hosts only - tighten before this leaves a laptop.
+            allowHost("localhost:5173")
+            allowHost("127.0.0.1:5173")
+            allowMethod(HttpMethod.Post)
+            allowMethod(HttpMethod.Delete)
+            allowHeader(HttpHeaders.ContentType)
+        }
         install(WebSockets) {
             pingPeriodMillis = WS_KEEPALIVE.inWholeMilliseconds
             timeoutMillis = WS_KEEPALIVE.inWholeMilliseconds
@@ -79,6 +94,25 @@ fun main() {
 
             get("/api/topology") {
                 call.respond(telemetry.topology().toDto())
+            }
+
+            // Operator-triggered outage. Duration comes from the query string so the
+            // request needs no body; the generator polls this and injects the fault.
+            post("/api/outage") {
+                val durationMs = call.request.queryParameters["durationMs"]?.toLongOrNull()
+                    ?: OutageController.DEFAULT_DURATION_MS
+                outages.request(durationMs)
+                log.info("outage requested for {}ms", durationMs)
+                call.respond(outages.state())
+            }
+
+            get("/api/outage") {
+                call.respond(outages.state())
+            }
+
+            delete("/api/outage") {
+                outages.clear()
+                call.respond(outages.state())
             }
 
             // Pushes the current graph topology to the visualiser once per second.
