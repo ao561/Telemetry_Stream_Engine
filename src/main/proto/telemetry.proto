@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package telemetry;
+
+import "google/protobuf/empty.proto";
+
+option java_package = "com.telemetry.stream.proto";
+option java_multiple_files = true;
+option java_outer_classname = "TelemetryProto";
+
+// A single observed call from one service to one of its dependencies.
+message ServiceMetric {
+  string service_id = 1;
+  string target_service = 2;
+  int64 timestamp = 3;
+  double latency_ms = 4;
+  double error_rate = 5;
+}
+
+message HealthStatus {
+  string service_id = 1;
+  // One of: HEALTHY, WARNING, CRITICAL.
+  string status = 2;
+  double blast_radius_score = 3;
+}
+
+// A node in the service dependency graph.
+message ServiceNode {
+  string service_id = 1;
+  // One of: HEALTHY, WARNING, CRITICAL.
+  string status = 2;
+  double blast_radius_score = 3;
+}
+
+// A directed edge: service_id calls target_service.
+message DependencyEdge {
+  string source_service_id = 1;
+  string target_service_id = 2;
+  double avg_latency_ms = 3;
+  double avg_error_rate = 4;
+  int64 call_count = 5;
+}
+
+message GraphTopologyResponse {
+  repeated ServiceNode nodes = 1;
+  repeated DependencyEdge edges = 2;
+}
+
+service TelemetryService {
+  // Agents push observations over a long-lived client stream; the server replies
+  // once the stream completes with the health of the reporting service.
+  rpc StreamMetrics(stream ServiceMetric) returns (HealthStatus);
+
+  // Point-in-time read of the whole dependency graph, for the visualiser.
+  rpc GetGraphTopology(google.protobuf.Empty) returns (GraphTopologyResponse);
+}
