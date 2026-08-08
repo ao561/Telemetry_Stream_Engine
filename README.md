@@ -3,6 +3,57 @@
 Distributed metric aggregator & visualiser. Kotlin/JVM, gRPC for ingest and fan-out,
 Ktor for the HTTP/WebSocket front end.
 
+## How it works
+
+Three processes. Telemetry flows one way; operator control flows back the other.
+
+```
+  MockClusterGenerator  ──gRPC StreamMetrics──▶  TelemetryServiceImpl  ──WebSocket──▶  dashboard
+   one stream per                                 50-sample window per     1 Hz         React Flow
+   dependency edge,                               service -> status,                    canvas
+   a sample per 500 ms                            edges, blast radius
+          ▲                                                 ▲
+          └──── GET /api/controls, every 500 ms ──── ControlPlane ◀──── POST from the dashboard
+                (outage window, breakers armed?)     (records intent only)
+```
+
+**Ingest.** The generator runs 9 coroutines in one JVM: a long-lived `StreamMetrics` RPC for each
+of the 5 dependency edges, plus the service-time ticker, the fault scheduler, the control poller
+and a console reporter. Each stream emits one `ServiceMetric` per 500 ms describing a call to one
+dependency, so a service with two dependencies emits two samples per tick — which is why its
+rolling window covers less wall-clock time than a single-dependency service's.
+
+Nothing is ever sent *between* the simulated services. The graph is reconstructed server-side by
+joining `service_id → target_service` pairs, which is how real agent-based telemetry works: each
+agent reports only its own outbound calls.
+
+**Aggregation.** The server retains the last 50 metrics per service and derives everything from
+them: rolling latency and error rate, the HEALTHY/WARNING/CRITICAL status, the edge set, and blast
+radius. It never fabricates telemetry.
+
+**Fan-out.** One ticker serialises the graph per second and publishes it to every connected socket,
+so N browsers cost one serialisation per tick rather than N.
+
+**Control runs backwards.** *Simulate Outage* and the *Circuit Breakers* switch POST to the server,
+which records the request in `ControlPlane` and does nothing else. The generator polls
+`/api/controls` and performs the actual work — injecting the fault, arming or disarming breakers —
+so the consequences still arrive through the normal ingest path rather than being painted on.
+
+### Two clocks, and most of the surprises
+
+Nearly every non-obvious behaviour here comes from one gap:
+
+| | Period |
+| --- | --- |
+| generator tick, breaker decisions, control poll | **500 ms** |
+| server's 50-sample rolling window | **25 s** |
+
+The simulated physics moves fifty times faster than the measurement of it. A breaker trips ~1.5 s
+into a fault while the status that would have revealed that fault needs ~25 s to move — so with
+breakers armed the dashboard can show a perfectly healthy cluster *during* a live outage. That is
+why the incident banner treats an open circuit as an incident in its own right instead of trusting
+node colour, and why the fault-cadence table below only makes sense with breakers disarmed.
+
 ## Stack
 
 | Component | Version |
@@ -19,9 +70,11 @@ Ktor for the HTTP/WebSocket front end.
 ## Layout
 
 ```
-src/main/proto/       .proto sources - compiled automatically, no per-file wiring
-src/main/kotlin/      service implementation and servers
-src/test/kotlin/      in-process gRPC tests
+src/main/proto/                        .proto sources - compiled automatically, no per-file wiring
+src/main/kotlin/com/telemetry/stream/  gRPC service, Ktor app, control plane
+                                .../tools/  MockClusterGenerator - the simulated estate
+src/test/kotlin/                       in-process gRPC tests
+frontend/src/                          React + React Flow dashboard
 ```
 
 ## Protobuf codegen
