@@ -131,6 +131,9 @@ class TelemetryServiceImpl(
                 callCount = calls.size.toLong()
                 avgLatencyMs = if (calls.isEmpty()) 0.0 else calls.sumOf { it.latencyMs } / calls.size
                 avgErrorRate = if (calls.isEmpty()) 0.0 else calls.sumOf { it.errorRate } / calls.size
+                // The window is oldest-first, so the last retained call is the current state.
+                // A breaker that trips mid-window must not read as closed for another 25s.
+                circuitOpen = calls.lastOrNull()?.circuitOpen ?: false
             }
         }
     }

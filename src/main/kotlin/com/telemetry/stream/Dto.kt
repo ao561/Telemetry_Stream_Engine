@@ -31,6 +31,7 @@ data class DependencyEdgeDto(
     val avgLatencyMs: Double,
     val avgErrorRate: Double,
     val callCount: Long,
+    val circuitOpen: Boolean,
 )
 
 @Serializable
@@ -59,6 +60,7 @@ fun DependencyEdge.toDto(): DependencyEdgeDto = DependencyEdgeDto(
     avgLatencyMs = avgLatencyMs,
     avgErrorRate = avgErrorRate,
     callCount = callCount,
+    circuitOpen = circuitOpen,
 )
 
 fun GraphTopologyResponse.toDto(): GraphTopologyDto = GraphTopologyDto(
@@ -67,7 +69,8 @@ fun GraphTopologyResponse.toDto(): GraphTopologyDto = GraphTopologyDto(
 )
 
 @Serializable
-data class OutageStateDto(
-    val active: Boolean,
-    val remainingMs: Long,
+data class ControlStateDto(
+    val outageActive: Boolean,
+    val outageRemainingMs: Long,
+    val circuitBreakersEnabled: Boolean,
 )

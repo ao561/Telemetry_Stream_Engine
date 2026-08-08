@@ -36,6 +36,7 @@ const SPARK_PAD = 7
 
 /** Mirrors CRITICAL_LATENCY_MS on the server, drawn as the sparkline's threshold line. */
 const CRITICAL_LATENCY_MS = 200
+const CIRCUIT_COLOR = '#f59e0b'
 
 /** Keeps the panel bounded during a long session. */
 const LOG_LIMIT = 300
@@ -77,6 +78,8 @@ type DependencyEdgeDto = {
   avgLatencyMs: number
   avgErrorRate: number
   callCount: number
+  /** The caller's breaker on this dependency is open; calls are served from a fallback. */
+  circuitOpen: boolean
 }
 
 type GraphTopologyDto = {
@@ -84,9 +87,10 @@ type GraphTopologyDto = {
   edges: DependencyEdgeDto[]
 }
 
-type OutageStateDto = {
-  active: boolean
-  remainingMs: number
+type ControlStateDto = {
+  outageActive: boolean
+  outageRemainingMs: number
+  circuitBreakersEnabled: boolean
 }
 
 type LatencySample = { t: number; latencyMs: number }
@@ -230,8 +234,8 @@ function LatencyEdge({
     targetPosition,
   })
 
-  const ratio = (data as { labelPosition?: number } | undefined)?.labelPosition
-    ?? LABEL_POSITION_BASE
+  const meta = data as { labelPosition?: number; circuitOpen?: boolean } | undefined
+  const ratio = meta?.labelPosition ?? LABEL_POSITION_BASE
 
   const badge = useMemo(
     () => pointAlongPath(path, ratio) ?? { x: midX, y: midY },
@@ -244,7 +248,7 @@ function LatencyEdge({
       {label != null && (
         <EdgeLabelRenderer>
           <div
-            className="edge-badge"
+            className={`edge-badge${meta?.circuitOpen ? ' edge-badge-open' : ''}`}
             style={{ transform: `translate(-50%, -50%) translate(${badge.x}px, ${badge.y}px)` }}
           >
             {label}
@@ -402,7 +406,23 @@ function analyseRootCause(topology: GraphTopologyDto): RootCause | null {
   // mid-chain service can sit at WARNING while its callers are still CRITICAL; ignoring it would
   // make a caller look like the frontier and get the blame instead of the real leaf below it.
   const degraded = topology.nodes.filter((node) => node.status !== 'HEALTHY')
-  if (degraded.length === 0) return null
+
+  // A tripped breaker hides the fault: the fallback path is fast and clean, so every service can
+  // read HEALTHY while the dependency underneath is still broken. Report it rather than claiming
+  // all is well.
+  if (degraded.length === 0) {
+    const open = topology.edges.filter((edge) => edge.circuitOpen)
+    if (open.length === 0) return null
+    const service = open[0].target
+    const dependents = dependentsOf(service, topology.edges)
+    return {
+      service,
+      impacted: [],
+      dependents: dependents.size,
+      severity: 'WARNING',
+      evidence: `${open.length} circuit${open.length > 1 ? 's' : ''} open — traffic on fallback`,
+    }
+  }
 
   const degradedIds = new Set(degraded.map((node) => node.serviceId))
   const frontier = degraded.filter(
@@ -531,8 +551,11 @@ function ServiceDrawer({ topology, serviceId, history, onClose }: DrawerProps) {
         ) : (
           <ul className="drawer-list">
             {outbound.map((edge) => (
-              <li key={edge.target}>
-                <span className="peer">{edge.target}</span>
+              <li key={edge.target} className={edge.circuitOpen ? 'peer-open' : undefined}>
+                <span className="peer">
+                  {edge.target}
+                  {edge.circuitOpen && <span className="peer-badge">circuit open</span>}
+                </span>
                 <span className="peer-stats">
                   {ms(edge.avgLatencyMs)} · {pct(edge.avgErrorRate)} · {edge.callCount} calls
                 </span>
@@ -593,6 +616,7 @@ function deriveEvents(
   statsById: Map<string, OutboundStats>,
   lastStatus: { current: Map<string, Status> },
   lastRootCause: { current: string | null },
+  lastCircuits: { current: Set<string> },
 ): LogEntry[] {
   const events: LogEntry[] = []
   const previous = lastStatus.current
@@ -639,8 +663,23 @@ function deriveEvents(
     events.push(logEntry('INFO', 'Cluster status normal — all services healthy'))
   }
 
+  const open = new Set(
+    incoming.edges.filter((edge) => edge.circuitOpen).map((edge) => `${edge.source}->${edge.target}`),
+  )
+  for (const edge of open) {
+    if (!lastCircuits.current.has(edge)) {
+      events.push(logEntry('WARN', `Circuit OPEN on ${edge} — calls short-circuited to fallback`))
+    }
+  }
+  for (const edge of lastCircuits.current) {
+    if (!open.has(edge)) {
+      events.push(logEntry('INFO', `Circuit CLOSED on ${edge} — dependency recovered`))
+    }
+  }
+
   lastStatus.current = current
   lastRootCause.current = rca?.service ?? null
+  lastCircuits.current = open
   return events
 }
 
@@ -721,6 +760,7 @@ export default function App() {
   // Previous cluster state, so events fire on transitions rather than once per frame.
   const lastStatusRef = useRef<Map<string, Status>>(new Map())
   const lastRootCauseRef = useRef<string | null>(null)
+  const lastCircuitsRef = useRef<Set<string>>(new Set())
 
   const appendLog = useCallback((entries: LogEntry[]) => {
     if (entries.length === 0) return
@@ -732,6 +772,7 @@ export default function App() {
 
   const [outageEndsAt, setOutageEndsAt] = useState(0)
   const [outageError, setOutageError] = useState<string | null>(null)
+  const [breakersEnabled, setBreakersEnabled] = useState(true)
   const [clock, setClock] = useState(() => Date.now())
 
   // Drives the outage countdown without re-rendering on every websocket frame.
@@ -751,10 +792,11 @@ export default function App() {
         { method: 'POST' },
       )
       if (!response.ok) throw new Error(`server returned ${response.status}`)
-      const state = (await response.json()) as OutageStateDto
-      setOutageEndsAt(Date.now() + state.remainingMs)
+      const state = (await response.json()) as ControlStateDto
+      setOutageEndsAt(Date.now() + state.outageRemainingMs)
+      setBreakersEnabled(state.circuitBreakersEnabled)
       appendLog([
-        logEntry('ALERT', `Outage injected for ${(state.remainingMs / 1000).toFixed(0)}s`),
+        logEntry('ALERT', `Outage injected for ${(state.outageRemainingMs / 1000).toFixed(0)}s`),
       ])
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'request failed'
@@ -762,6 +804,47 @@ export default function App() {
       appendLog([logEntry('WARN', `Outage request failed — ${reason}`)])
     }
   }, [appendLog])
+
+  const toggleBreakers = useCallback(
+    async (enabled: boolean) => {
+      // Optimistic, so the switch feels immediate; the response is authoritative.
+      setBreakersEnabled(enabled)
+      try {
+        const response = await fetch(
+          `${API_BASE}/api/circuit-breakers?enabled=${enabled}`,
+          { method: 'POST' },
+        )
+        if (!response.ok) throw new Error(`server returned ${response.status}`)
+        const state = (await response.json()) as ControlStateDto
+        setBreakersEnabled(state.circuitBreakersEnabled)
+        appendLog([
+          logEntry(
+            enabled ? 'INFO' : 'WARN',
+            `Circuit breakers ${enabled ? 'armed' : 'disarmed'} — dependency failures will ${enabled ? 'be short-circuited' : 'cascade upstream'}`,
+          ),
+        ])
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'request failed'
+        setBreakersEnabled(!enabled)
+        appendLog([logEntry('WARN', `Circuit breaker toggle failed — ${reason}`)])
+      }
+    },
+    [appendLog],
+  )
+
+  // The switch reflects server state, so a reload does not show a stale position.
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API_BASE}/api/controls`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((state: ControlStateDto | null) => {
+        if (!cancelled && state) setBreakersEnabled(state.circuitBreakersEnabled)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const applyTopology = useCallback(
     (incoming: GraphTopologyDto) => {
@@ -812,18 +895,27 @@ export default function App() {
 
       setEdges(
         incoming.edges.map((edge) => {
-          const stroke = edgeStroke(edge.avgErrorRate)
+          // An open breaker is its own signal: amber and broken, regardless of error rate,
+          // because the fallback path is fast and clean and would otherwise render healthy.
+          const stroke = edge.circuitOpen ? CIRCUIT_COLOR : edgeStroke(edge.avgErrorRate)
           const index = outboundSeen.get(edge.source) ?? 0
           outboundSeen.set(edge.source, index + 1)
           return {
             id: `${edge.source}->${edge.target}`,
             source: edge.source,
             target: edge.target,
-            label: `${edge.avgLatencyMs.toFixed(0)} ms`,
-            animated: edge.avgErrorRate > 0.05,
+            label: edge.circuitOpen
+              ? `OPEN · ${edge.avgLatencyMs.toFixed(0)} ms`
+              : `${edge.avgLatencyMs.toFixed(0)} ms`,
+            animated: !edge.circuitOpen && edge.avgErrorRate > 0.05,
             markerEnd: { ...EDGE_MARKER, color: stroke },
-            style: { stroke, strokeWidth: EDGE_STROKE_WIDTH },
+            style: {
+              stroke,
+              strokeWidth: EDGE_STROKE_WIDTH,
+              ...(edge.circuitOpen ? { strokeDasharray: '7 5' } : {}),
+            },
             data: {
+              circuitOpen: edge.circuitOpen,
               labelPosition: Math.min(
                 LABEL_POSITION_BASE + index * LABEL_POSITION_STEP,
                 LABEL_POSITION_MAX,
@@ -833,7 +925,7 @@ export default function App() {
         }),
       )
 
-      appendLog(deriveEvents(incoming, statsById, lastStatusRef, lastRootCauseRef))
+      appendLog(deriveEvents(incoming, statsById, lastStatusRef, lastRootCauseRef, lastCircuitsRef))
       setLastUpdate(new Date())
     },
     [setNodes, setEdges, appendLog],
@@ -924,6 +1016,17 @@ export default function App() {
 
         <div className="bar-actions">
           {outageError && <span className="bar-error">outage failed: {outageError}</span>}
+          <label className={`switch${breakersEnabled ? ' switch-on' : ''}`}>
+            <input
+              type="checkbox"
+              checked={breakersEnabled}
+              onChange={(event) => toggleBreakers(event.currentTarget.checked)}
+            />
+            <span className="switch-track" aria-hidden="true">
+              <span className="switch-thumb" />
+            </span>
+            Circuit Breakers
+          </label>
           <button
             className={`btn-outage${outageActive ? ' btn-outage-live' : ''}`}
             onClick={triggerOutage}

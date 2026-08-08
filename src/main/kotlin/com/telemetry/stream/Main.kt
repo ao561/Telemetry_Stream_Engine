@@ -41,7 +41,7 @@ private val WS_KEEPALIVE = 15.seconds
 
 fun main() {
     val telemetry = TelemetryServiceImpl()
-    val outages = OutageController()
+    val controls = ControlPlane()
     val json = Json { encodeDefaults = true }
 
     val grpcServer: Server = ServerBuilder.forPort(GRPC_PORT)
@@ -96,23 +96,30 @@ fun main() {
                 call.respond(telemetry.topology().toDto())
             }
 
-            // Operator-triggered outage. Duration comes from the query string so the
-            // request needs no body; the generator polls this and injects the fault.
-            post("/api/outage") {
-                val durationMs = call.request.queryParameters["durationMs"]?.toLongOrNull()
-                    ?: OutageController.DEFAULT_DURATION_MS
-                outages.request(durationMs)
-                log.info("outage requested for {}ms", durationMs)
-                call.respond(outages.state())
+            // Operator controls. The generator polls /api/controls and does the real work;
+            // the server only records what was asked for.
+            get("/api/controls") {
+                call.respond(controls.state())
             }
 
-            get("/api/outage") {
-                call.respond(outages.state())
+            post("/api/outage") {
+                val durationMs = call.request.queryParameters["durationMs"]?.toLongOrNull()
+                    ?: ControlPlane.DEFAULT_OUTAGE_MS
+                controls.requestOutage(durationMs)
+                log.info("outage requested for {}ms", durationMs)
+                call.respond(controls.state())
             }
 
             delete("/api/outage") {
-                outages.clear()
-                call.respond(outages.state())
+                controls.clearOutage()
+                call.respond(controls.state())
+            }
+
+            post("/api/circuit-breakers") {
+                val enabled = call.request.queryParameters["enabled"]?.toBooleanStrictOrNull() ?: true
+                controls.setCircuitBreakersEnabled(enabled)
+                log.info("circuit breakers {}", if (enabled) "enabled" else "disabled")
+                call.respond(controls.state())
             }
 
             // Pushes the current graph topology to the visualiser once per second.

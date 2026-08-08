@@ -15,6 +15,8 @@ message ServiceMetric {
   int64 timestamp = 3;
   double latency_ms = 4;
   double error_rate = 5;
+  // True when the caller short-circuited this call instead of really making it.
+  bool circuit_open = 6;
 }
 
 message HealthStatus {
@@ -39,6 +41,8 @@ message DependencyEdge {
   double avg_latency_ms = 3;
   double avg_error_rate = 4;
   int64 call_count = 5;
+  // True when the most recent call on this edge was short-circuited by an open breaker.
+  bool circuit_open = 6;
 }
 
 message GraphTopologyResponse {
