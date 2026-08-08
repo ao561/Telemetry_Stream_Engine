@@ -152,12 +152,21 @@
 /* ----------------------------------------------------------------- stage */
 
 .stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Holds the graph plus its overlays; the log docks below rather than covering
+   React Flow's controls and minimap. */
+.canvas {
   position: relative;
   flex: 1;
   min-height: 0;
 }
 
-.stage .react-flow { background: var(--bg); }
+.canvas .react-flow { background: var(--bg); }
 
 .stage-empty {
   position: absolute;
@@ -171,6 +180,119 @@
 .stage-empty code {
   font-family: var(--mono);
   color: var(--muted);
+}
+
+/* --------------------------------------------------------------- rca banner */
+
+.rca {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  right: 16px;
+  z-index: 5;
+  display: flex;
+  pointer-events: none;
+  transition: right 160ms ease;
+}
+
+/* Keep clear of the detail drawer when it is open. */
+.rca-shifted { right: 372px; }
+
+.rca-card {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  max-width: 100%;
+  padding: 9px 14px;
+  border: 1px solid;
+  border-radius: 9px;
+  backdrop-filter: blur(6px);
+  font-size: 12.5px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+
+.rca-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.rca-text strong { font-weight: 650; }
+
+.rca-text span {
+  font-size: 11.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rca-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.rca-tag {
+  flex: 0 0 auto;
+  margin-left: 4px;
+  padding: 2.5px 8px;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  border-radius: 999px;
+  background: rgba(239, 68, 68, 0.16);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #fca5a5;
+}
+
+.rca-incident {
+  background: rgba(45, 12, 14, 0.86);
+  border-color: rgba(239, 68, 68, 0.55);
+  color: #fee2e2;
+}
+
+.rca-incident .rca-dot {
+  background: var(--critical);
+  animation: rca-pulse 1.1s ease-in-out infinite;
+}
+
+.rca-pending {
+  background: rgba(48, 33, 8, 0.86);
+  border-color: rgba(245, 158, 11, 0.5);
+  color: #fde68a;
+}
+
+.rca-pending .rca-dot {
+  background: var(--warning);
+  animation: rca-pulse 1.1s ease-in-out infinite;
+}
+
+/* Healthy state is a compact pill, not a full banner. */
+.rca-ok {
+  background: rgba(6, 32, 24, 0.72);
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #6ee7b7;
+  font-size: 11.5px;
+  padding: 6px 12px;
+}
+
+.rca-ok .rca-dot {
+  background: var(--healthy);
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.8);
+}
+
+@keyframes rca-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rca-incident .rca-dot,
+  .rca-pending .rca-dot { animation: none; }
 }
 
 /* ------------------------------------------------------------- node card */
@@ -407,17 +529,178 @@
   color: var(--muted);
 }
 
+/* -------------------------------------------------------------- sparkline */
+
+.spark { color: var(--healthy); }
+.spark-healthy { color: var(--healthy); }
+.spark-warning { color: var(--warning); }
+.spark-critical { color: var(--critical); }
+
+.spark-head {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 5px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+}
+
+.spark svg {
+  display: block;
+  overflow: visible;
+}
+
+/* The glow is a drop-shadow in the line's own colour, so it tracks the status class. */
+.spark-line {
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 5px currentColor);
+}
+
+.spark-tip {
+  fill: currentColor;
+  filter: drop-shadow(0 0 5px currentColor);
+}
+
+.spark-threshold {
+  stroke: var(--faint);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+  opacity: 0.65;
+}
+
+.spark-threshold-label {
+  fill: var(--faint);
+  font-family: var(--mono);
+  font-size: 9px;
+  text-anchor: end;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spark-line,
+  .spark-tip { filter: none; }
+}
+
+/* --------------------------------------------------------------- log panel */
+
+.log {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  height: 196px;
+  border-top: 1px solid var(--border);
+  background: #060910;
+  transition: height 160ms ease, margin-right 160ms ease;
+}
+
+.log-collapsed { height: 33px; }
+
+/* Sit clear of the detail drawer when it is open. */
+.log-inset { margin-right: 340px; }
+
+.log-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  height: 32px;
+  padding: 0 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.log-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: 600 11px/1 inherit;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.log-caret {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--muted);
+  transition: transform 140ms ease;
+}
+
+.log-caret-closed { transform: rotate(-90deg); }
+
+.log-count {
+  padding: 1.5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.log-clear {
+  margin-left: auto;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font: 500 11px/1 inherit;
+  cursor: pointer;
+}
+
+.log-clear:hover:not(:disabled) { color: var(--text); border-color: var(--faint); }
+.log-clear:disabled { opacity: 0.4; cursor: default; }
+
+.log-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 12px 10px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.log-empty {
+  margin: 0;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.log-line {
+  display: flex;
+  gap: 8px;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.log-time { color: var(--faint); flex: 0 0 auto; }
+.log-level { flex: 0 0 auto; font-weight: 700; }
+.log-msg { color: var(--muted); }
+
+.log-info  .log-level { color: #7dd3fc; }
+.log-warn  .log-level { color: var(--warning); }
+.log-alert .log-level { color: var(--critical); }
+.log-alert .log-msg   { color: #f3c9c9; }
+
 /* ------------------------------------------------- react-flow chrome tweaks */
 
-.stage .react-flow__controls-button {
+.canvas .react-flow__controls-button {
   background: var(--panel-2);
   border-bottom: 1px solid var(--border);
   fill: var(--muted);
 }
 
-.stage .react-flow__controls-button:hover { background: var(--border); }
+.canvas .react-flow__controls-button:hover { background: var(--border); }
 
-.stage .react-flow__minimap {
+.canvas .react-flow__minimap {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -441,7 +724,7 @@
   box-shadow: 0 1px 7px rgba(0, 0, 0, 0.55);
 }
 
-.stage .react-flow__attribution {
+.canvas .react-flow__attribution {
   background: transparent;
   color: var(--faint);
 }
