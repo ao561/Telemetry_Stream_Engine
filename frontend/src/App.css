@@ -39,20 +39,6 @@
   border-bottom: 1px solid var(--border);
 }
 
-.bar-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.bar-mark {
-  width: 9px;
-  height: 9px;
-  border-radius: 2px;
-  background: var(--accent);
-  box-shadow: 0 0 12px rgba(56, 189, 248, 0.8);
-}
-
 .bar h1 {
   margin: 0;
   font-size: 14px;
@@ -166,6 +152,42 @@
   .switch-thumb { transition: none; }
 }
 
+.outage-duration {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.outage-duration input {
+  width: 46px;
+  padding: 6px 6px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: 500 11.5px/1 var(--mono);
+  text-align: right;
+}
+
+.outage-duration input:disabled { opacity: 0.5; }
+.outage-duration input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.outage-target {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: 500 11.5px/1 inherit;
+  font-family: var(--mono);
+  cursor: pointer;
+}
+
+.outage-target:hover:not(:disabled) { border-color: var(--faint); }
+.outage-target:disabled { opacity: 0.5; cursor: default; }
+
 .btn-outage {
   padding: 7px 14px;
   border: 1px solid rgba(239, 68, 68, 0.55);
@@ -224,7 +246,7 @@
 }
 
 /* Holds the graph plus its overlays; the log docks below rather than covering
-   React Flow's controls and minimap. */
+   React Flow's controls. */
 .canvas {
   position: relative;
   flex: 1;
@@ -785,12 +807,6 @@
 
 .canvas .react-flow__controls-button:hover { background: var(--border); }
 
-.canvas .react-flow__minimap {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-
 /* Latency badge, rendered as HTML by LatencyEdge via EdgeLabelRenderer. The opaque
    background and border keep it readable where edges cross behind it. */
 .edge-badge {
@@ -816,7 +832,3 @@
   color: #fcd34d;
 }
 
-.canvas .react-flow__attribution {
-  background: transparent;
-  color: var(--faint);
-}

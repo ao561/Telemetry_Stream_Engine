@@ -105,8 +105,10 @@ fun main() {
             post("/api/outage") {
                 val durationMs = call.request.queryParameters["durationMs"]?.toLongOrNull()
                     ?: ControlPlane.DEFAULT_OUTAGE_MS
-                controls.requestOutage(durationMs)
-                log.info("outage requested for {}ms", durationMs)
+                val service = call.request.queryParameters["service"]
+                    ?: ControlPlane.DEFAULT_OUTAGE_SERVICE
+                controls.requestOutage(service, durationMs)
+                log.info("outage requested on {} for {}ms", service, durationMs)
                 call.respond(controls.state())
             }
 

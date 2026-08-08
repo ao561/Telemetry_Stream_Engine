@@ -7,7 +7,6 @@ import {
   getSmoothStepPath,
   Handle,
   MarkerType,
-  MiniMap,
   Position,
   ReactFlow,
   useEdgesState,
@@ -26,7 +25,11 @@ import './App.css'
 const API_BASE = 'http://localhost:8080'
 const WS_URL = 'ws://localhost:8080/ws/metrics'
 const RECONNECT_DELAY_MS = 2000
-const OUTAGE_DURATION_MS = 15000
+const OUTAGE_DEFAULT_SECONDS = 15
+// Mirrors ControlPlane's MIN/MAX_DURATION_MS clamp, so the field cannot ask for
+// something the server would silently rewrite.
+const OUTAGE_MIN_SECONDS = 1
+const OUTAGE_MAX_SECONDS = 120
 
 /** Rolling latency history kept per service for the drawer sparkline. */
 const HISTORY_WINDOW_MS = 30_000
@@ -90,6 +93,7 @@ type GraphTopologyDto = {
 type ControlStateDto = {
   outageActive: boolean
   outageRemainingMs: number
+  outageService: string
   circuitBreakersEnabled: boolean
 }
 
@@ -174,12 +178,6 @@ function layout(topology: GraphTopologyDto): Map<string, XYPosition> {
     positions.set(node.serviceId, { x: column * COLUMN_WIDTH, y: row * ROW_HEIGHT })
   }
   return positions
-}
-
-const STATUS_COLOR: Record<Status, string> = {
-  HEALTHY: '#10b981',
-  WARNING: '#f59e0b',
-  CRITICAL: '#ef4444',
 }
 
 /** Shared by every edge; per-edge options below only add the error-rate colouring. */
@@ -772,7 +770,28 @@ export default function App() {
 
   const [outageEndsAt, setOutageEndsAt] = useState(0)
   const [outageError, setOutageError] = useState<string | null>(null)
-  const [breakersEnabled, setBreakersEnabled] = useState(true)
+  const [breakersEnabled, setBreakersEnabled] = useState(false)
+  const [outageSeconds, setOutageSeconds] = useState(String(OUTAGE_DEFAULT_SECONDS))
+  const [outageTarget, setOutageTarget] = useState('db-primary')
+
+  // Kept as a string so the field can be cleared while typing; parsed and clamped on use.
+  const parsedOutageSeconds = (() => {
+    const parsed = Number.parseInt(outageSeconds, 10)
+    if (!Number.isFinite(parsed)) return OUTAGE_DEFAULT_SECONDS
+    return Math.min(Math.max(parsed, OUTAGE_MIN_SECONDS), OUTAGE_MAX_SECONDS)
+  })()
+
+  const faultableServices = useMemo(
+    () => [...new Set((topology?.edges ?? []).map((edge) => edge.target))].sort(),
+    [topology],
+  )
+
+  // Derived, not corrected in an effect: if the graph changes and drops the selected service
+  // the fallback applies on the same render instead of costing a cascading one.
+  const effectiveOutageTarget =
+    faultableServices.length === 0 || faultableServices.includes(outageTarget)
+      ? outageTarget
+      : faultableServices[0]
   const [clock, setClock] = useState(() => Date.now())
 
   // Drives the outage countdown without re-rendering on every websocket frame.
@@ -788,7 +807,7 @@ export default function App() {
     setOutageError(null)
     try {
       const response = await fetch(
-        `${API_BASE}/api/outage?durationMs=${OUTAGE_DURATION_MS}`,
+        `${API_BASE}/api/outage?service=${encodeURIComponent(effectiveOutageTarget)}&durationMs=${parsedOutageSeconds * 1000}`,
         { method: 'POST' },
       )
       if (!response.ok) throw new Error(`server returned ${response.status}`)
@@ -796,14 +815,17 @@ export default function App() {
       setOutageEndsAt(Date.now() + state.outageRemainingMs)
       setBreakersEnabled(state.circuitBreakersEnabled)
       appendLog([
-        logEntry('ALERT', `Outage injected for ${(state.outageRemainingMs / 1000).toFixed(0)}s`),
+        logEntry(
+          'ALERT',
+          `Outage injected on ${state.outageService} for ${(state.outageRemainingMs / 1000).toFixed(0)}s`,
+        ),
       ])
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'request failed'
       setOutageError(reason)
       appendLog([logEntry('WARN', `Outage request failed — ${reason}`)])
     }
-  }, [appendLog])
+  }, [appendLog, effectiveOutageTarget, parsedOutageSeconds])
 
   const toggleBreakers = useCallback(
     async (enabled: boolean) => {
@@ -838,7 +860,10 @@ export default function App() {
     fetch(`${API_BASE}/api/controls`)
       .then((response) => (response.ok ? response.json() : null))
       .then((state: ControlStateDto | null) => {
-        if (!cancelled && state) setBreakersEnabled(state.circuitBreakersEnabled)
+        if (!cancelled && state) {
+          setBreakersEnabled(state.circuitBreakersEnabled)
+          setOutageTarget(state.outageService)
+        }
       })
       .catch(() => undefined)
     return () => {
@@ -985,6 +1010,7 @@ export default function App() {
     [topology],
   )
 
+
   const critical = useMemo(
     () => (topology?.nodes ?? []).filter((n) => n.status === 'CRITICAL').length,
     [topology],
@@ -997,10 +1023,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="bar">
-        <div className="bar-brand">
-          <span className="bar-mark" />
-          <h1>Telemetry Stream Engine</h1>
-        </div>
+        <h1>Telemetry Stream Engine</h1>
 
         <div className="bar-metrics">
           <span className="chip">
@@ -1027,6 +1050,32 @@ export default function App() {
             </span>
             Circuit Breakers
           </label>
+          <label className="outage-duration">
+            <input
+              type="number"
+              min={OUTAGE_MIN_SECONDS}
+              max={OUTAGE_MAX_SECONDS}
+              value={outageSeconds}
+              disabled={outageActive}
+              onChange={(event) => setOutageSeconds(event.currentTarget.value)}
+              onBlur={() => setOutageSeconds(String(parsedOutageSeconds))}
+              aria-label="Outage duration in seconds"
+            />
+            s
+          </label>
+          <select
+            className="outage-target"
+            value={effectiveOutageTarget}
+            onChange={(event) => setOutageTarget(event.currentTarget.value)}
+            disabled={outageActive || faultableServices.length === 0}
+            aria-label="Service to break"
+          >
+            {(faultableServices.length > 0 ? faultableServices : [effectiveOutageTarget]).map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </select>
           <button
             className={`btn-outage${outageActive ? ' btn-outage-live' : ''}`}
             onClick={triggerOutage}
@@ -1091,16 +1140,11 @@ export default function App() {
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
           defaultEdgeOptions={defaultEdgeOptions}
+          proOptions={{ hideAttribution: true }}
           fitView
         >
           <Background gap={22} size={1} color="#1e293b" />
           <Controls />
-          <MiniMap
-            pannable
-            zoomable
-            nodeColor={(node) => STATUS_COLOR[(node.data as ServiceCardData).status]}
-            maskColor="rgba(8, 12, 20, 0.75)"
-          />
         </ReactFlow>
 
         {topology && selectedId && (

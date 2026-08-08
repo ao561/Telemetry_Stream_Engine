@@ -34,7 +34,8 @@ radius. It never fabricates telemetry.
 **Fan-out.** One ticker serialises the graph per second and publishes it to every connected socket,
 so N browsers cost one serialisation per tick rather than N.
 
-**Control runs backwards.** *Simulate Outage* and the *Circuit Breakers* switch POST to the server,
+**Control runs backwards.** The *Simulate Outage* button, its service dropdown, and the
+*Circuit Breakers* switch POST to the server,
 which records the request in `ControlPlane` and does nothing else. The generator polls
 `/api/controls` and performs the actual work — injecting the fault, arming or disarming breakers —
 so the consequences still arrive through the normal ingest path rather than being painted on.
@@ -134,7 +135,7 @@ is derived directly from the ingest stream.
 | `GET /health` | liveness |
 | `GET /api/topology` | current graph, same shape as the WebSocket frame |
 | `GET /api/controls` | operator state; the generator polls this |
-| `POST /api/outage?durationMs=` | inject a `db-primary` outage |
+| `POST /api/outage?service=&durationMs=` | break one service; duration clamped to 1-120 s |
 | `DELETE /api/outage` | clear it early |
 | `POST /api/circuit-breakers?enabled=` | arm or disarm breakers |
 | `ws://…/ws/metrics` | pushes the whole graph once per second |
@@ -242,9 +243,10 @@ leaves held 0, and every plotted point stayed inside the viewbox while `auth-ser
 
 ### Circuit breakers
 
-Armed and disarmed from the **Circuit Breakers** switch in the header. The server records the
-intent at `POST /api/circuit-breakers?enabled=`, the generator picks it up from its `/api/controls`
-poll, and disarming resets every breaker so re-arming never resumes a stale OPEN.
+**Off by default** - the cascade is the more interesting thing to see first, and breakers suppress
+it almost entirely. Arm them from the **Circuit Breakers** switch in the header. The server records
+the intent at `POST /api/circuit-breakers?enabled=`, the generator picks it up from its
+`/api/controls` poll, and disarming resets every breaker so re-arming never resumes a stale OPEN.
 
 Each caller holds a breaker per dependency, in the generator. It trips on the direct dependency's
 **own internal execution time** - `BREAKER_TRIP_AFTER` consecutive ticks over
@@ -463,11 +465,40 @@ streams share one 50-entry window. Two consequences:
 That is a real observability pathology, not a bug - an average across dependencies hides the
 outlier. The drawer's per-edge breakdown is what exposes it.
 
+### Choosing what breaks
+
+The header carries three controls: a **duration** field in seconds (default 15, clamped 1-120 to
+match the server), a **service** dropdown, and the *Simulate Outage* button itself.
+
+One shared fault definition (`FAULT_LATENCY_MS`, `FAULT_ERROR_RATE`) is applied to whichever
+service is targeted, so every service is breakable without a per-service profile.
+
+The list is **restricted to services that have callers** - the targets of at least one edge.
+Breaking a root such as `frontend-gateway` would be invisible: health is derived from a service's
+*outbound* calls, and nothing calls a root, so its own latency spike is never observed by anyone.
+The same reasoning explains why a leaf never shows CRITICAL for its own fault.
+
+Measured with breakers disarmed, 27 s into a 30 s outage:
+
+| Broken service | Services degraded | Blast radius |
+| --- | --- | --- |
+| `db-primary` | auth-service, payment-api, frontend-gateway, notification-worker | 4 |
+| `redis-cache` | auth-service, payment-api, frontend-gateway, notification-worker | 4 |
+| `auth-service` | payment-api, frontend-gateway, notification-worker | 3 |
+
+Note the third row: breaking `auth-service` leaves `auth-service` itself HEALTHY. Its own calls to
+`db-primary` and `redis-cache` are still fast and clean - it is only slow *to its callers*. A
+mid-tier service is as invisible to its own fault as a leaf is, and the incident banner has to
+infer it the same way.
+
+Retargeting mid-outage works: the generator re-begins the window on the new service rather than
+extending the old one. An unknown or blank service falls back to `db-primary`.
+
 ### Tuning the fault cadence
 
-> These figures were measured with **circuit breakers disarmed**. Armed (the default), the breaker
-> trips ~1.5 s into a fault and the estate stays HEALTHY throughout - no cascade to tune. Turn the
-> **Circuit Breakers** switch off in the header to reproduce the behaviour below.
+> These figures were measured with **circuit breakers disarmed**, which is the default. Arm them
+> from the header switch and the breaker trips ~1.5 s into a fault, so the estate stays HEALTHY
+> throughout and there is no cascade left to tune.
 
 The 50-entry window holds **25 s** of history at a 500 ms sample rate, which interacts with the
 fault period:

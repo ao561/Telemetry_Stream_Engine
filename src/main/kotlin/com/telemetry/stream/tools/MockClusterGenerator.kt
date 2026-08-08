@@ -89,11 +89,14 @@ private class Service(
     val id: String,
     val localMs: ClosedFloatingPointRange<Double>,
     val localErrorRate: ClosedFloatingPointRange<Double>,
-    val faultedLocalMs: ClosedFloatingPointRange<Double>? = null,
-    val faultedErrorRate: ClosedFloatingPointRange<Double>? = null,
     /** Share of a dependency's failures this service swallows via retries and fallbacks. */
     val errorAbsorption: Double = 0.0,
 )
+
+/** What a faulting service looks like, whichever one is targeted. */
+private val FAULT_LATENCY_MS = 400.0..900.0
+private val FAULT_ERROR_RATE = 0.45..0.85
+private val DEFAULT_FAULT_SERVICE = System.getenv("FAULT_SERVICE") ?: "db-primary"
 
 /** One directed dependency. Latency is derived; only the error rate is scripted per hop. */
 private class Dependency(
@@ -131,13 +134,7 @@ private class Dependency(
  * notification-worker -/                                    \--> redis-cache  <- healthy sibling
  */
 private val SERVICES = listOf(
-    Service(
-        id = "db-primary",
-        localMs = 4.0..14.0,
-        localErrorRate = 0.0..0.004,
-        faultedLocalMs = 400.0..900.0,
-        faultedErrorRate = 0.45..0.85,
-    ),
+    Service(id = "db-primary", localMs = 4.0..14.0, localErrorRate = 0.0..0.004),
     Service(id = "redis-cache", localMs = 0.8..4.0, localErrorRate = 0.0..0.004),
     Service(
         id = "auth-service",
@@ -228,10 +225,19 @@ private class SpikeSchedule {
     @Volatile
     private var endsAt = Long.MIN_VALUE
 
-    fun begin(now: Long, durationMs: Long) {
+    @Volatile
+    private var target = DEFAULT_FAULT_SERVICE
+
+    fun begin(now: Long, durationMs: Long, service: String = DEFAULT_FAULT_SERVICE) {
         startedAt = now
         endsAt = now + durationMs
+        target = service
     }
+
+    fun target(): String = target
+
+    /** The service currently faulting, or null when the estate is healthy. */
+    fun faultedService(now: Long): String? = if (isActive(now)) target else null
 
     /**
      * Extends an in-flight window without moving its start, so the schedule keeps describing one
@@ -307,9 +313,12 @@ private class CircuitBreaker {
 private class CircuitBoard {
     private val breakers = ConcurrentHashMap<String, CircuitBreaker>()
 
-    /** Toggled from the dashboard. Disarmed breakers never short-circuit. */
+    /**
+     * Toggled from the dashboard. Disarmed breakers never short-circuit. Starts false to match
+     * the server's default, so the first 500 ms before the control poll lands behaves the same.
+     */
     @Volatile
-    var enabled: Boolean = true
+    var enabled: Boolean = false
         private set
 
     fun setEnabled(value: Boolean) {
@@ -384,7 +393,7 @@ private class ClusterState {
 private fun tickServiceTimes(
     cluster: ClusterState,
     board: CircuitBoard,
-    faulted: Boolean,
+    faultedService: String?,
 ): List<LatencyBreakdown> {
     val now = System.currentTimeMillis()
     val previousTotal = cluster.snapshot()
@@ -398,12 +407,14 @@ private fun tickServiceTimes(
     for (service in EVALUATION_ORDER) {
         // Sampled before the children are walked, so a breaker can read this service's own
         // execution time without it being contaminated by what it is waiting on.
-        val profile = service.faultedLocalMs?.takeIf { faulted } ?: service.localMs
-        val internalMs = profile.sample()
+        // Only the targeted service degrades; everything else runs normally and inherits
+        // whatever reaches it through the graph.
+        val isFaulting = service.id == faultedService
+        val internalMs = (if (isFaulting) FAULT_LATENCY_MS else service.localMs).sample()
         updatedInternal[service.id] = internalMs
 
-        val errorProfile = service.faultedErrorRate?.takeIf { faulted } ?: service.localErrorRate
-        val internalErrorRate = errorProfile.sample()
+        val internalErrorRate =
+            (if (isFaulting) FAULT_ERROR_RATE else service.localErrorRate).sample()
 
         // Bottom-up: every dependency has already been assigned in this same pass, so a parent
         // sees its children's post-spike values immediately. `previous*` only backstops an edge
@@ -496,8 +507,10 @@ private suspend fun driveServiceTimes(
     var ticksLeftToLog = 0
 
     while (currentCoroutineContext().isActive) {
-        val faulted = spikes.isActive(System.currentTimeMillis())
-        val breakdown = tickServiceTimes(cluster, board, faulted)
+        val now = System.currentTimeMillis()
+        val faultedService = spikes.faultedService(now)
+        val faulted = faultedService != null
+        val breakdown = tickServiceTimes(cluster, board, faultedService)
 
         val open = board.openEdges()
         if (open != lastOpen) {
@@ -508,7 +521,10 @@ private suspend fun driveServiceTimes(
             lastOpen = open
         }
 
-        if (faulted && !wasFaulted) ticksLeftToLog = BREAKDOWN_TICKS
+        if (faulted && !wasFaulted) {
+            ticksLeftToLog = BREAKDOWN_TICKS
+            println("  !! fault active on $faultedService")
+        }
         if (!faulted && wasFaulted) printBreakdown("recovered", breakdown)
         if (ticksLeftToLog > 0) {
             printBreakdown("outage tick ${BREAKDOWN_TICKS - ticksLeftToLog + 1}", breakdown)
@@ -530,7 +546,7 @@ fun main(args: Array<String>) = runBlocking<Unit> {
 
     // One bottom-up pass seeds the whole graph, since each service is evaluated after its
     // dependencies - so the first metrics carry steady-state values rather than zeros.
-    tickServiceTimes(cluster, board, faulted = false)
+    tickServiceTimes(cluster, board, faultedService = null)
 
     println("streaming synthetic cluster telemetry to $target")
     CLUSTER.forEach { println("  ${it.source} -> ${it.target}") }
@@ -585,8 +601,8 @@ private suspend fun driveSpikes(spikes: SpikeSchedule) {
     while (currentCoroutineContext().isActive) {
         delay(SPIKE_INTERVAL_MS)
         val duration = Random.nextLong(SPIKE_DURATION_MS.first, SPIKE_DURATION_MS.last)
-        spikes.begin(System.currentTimeMillis(), duration)
-        println("  !! db-primary fault injected for ${duration}ms")
+        spikes.begin(System.currentTimeMillis(), duration, DEFAULT_FAULT_SERVICE)
+        println("  !! $DEFAULT_FAULT_SERVICE fault injected for ${duration}ms")
     }
 }
 
@@ -628,13 +644,18 @@ private suspend fun followOperatorControls(board: CircuitBoard, spikes: SpikeSch
         }
 
         if (state.outageActive) {
-            if (announced) {
+            // Re-begin when the operator retargets mid-flight, so the new service starts faulting
+            // immediately rather than inheriting the old window's target.
+            if (announced && state.outageService == spikes.target()) {
                 // Track whatever the server still has left, without moving the window's start.
                 spikes.extendTo(now + state.outageRemainingMs)
             } else {
-                spikes.begin(now, state.outageRemainingMs)
+                spikes.begin(now, state.outageRemainingMs, state.outageService)
                 announced = true
-                println("  !! operator-triggered outage on db-primary (${state.outageRemainingMs}ms)")
+                println(
+                    "  !! operator-triggered outage on ${state.outageService} " +
+                        "(${state.outageRemainingMs}ms)"
+                )
             }
         } else {
             announced = false

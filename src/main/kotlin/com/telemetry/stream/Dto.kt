@@ -72,5 +72,6 @@ fun GraphTopologyResponse.toDto(): GraphTopologyDto = GraphTopologyDto(
 data class ControlStateDto(
     val outageActive: Boolean,
     val outageRemainingMs: Long,
+    val outageService: String,
     val circuitBreakersEnabled: Boolean,
 )
