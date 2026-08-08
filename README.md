@@ -3,6 +3,33 @@
 Distributed metric aggregator & visualiser. Kotlin/JVM, gRPC for ingest and fan-out,
 Ktor for the HTTP/WebSocket front end.
 
+## Quick start
+
+Needs **JDK 21+** and **Node 20.19+ / 22.12+** (Vite 8). Gradle comes via the wrapper.
+
+Three processes, in this order — the generator needs the server, the dashboard needs both:
+
+```sh
+# terminal 1 — server: gRPC on :50051, HTTP/WebSocket on :8080
+./gradlew run
+
+# terminal 2 — the simulated microservice estate
+SPIKE_INTERVAL_MS=3600000 ./gradlew mockCluster
+
+# terminal 3 — dashboard on http://localhost:5173
+cd frontend && npm install && npm run dev
+```
+
+Wait for terminal 1 to print `gRPC listening on 50051` before starting terminal 2, otherwise it
+retries every 2 s until the server appears.
+
+Open <http://localhost:5173> and you should see six services wired into a dependency graph, all
+green, with latency figures on every edge. Then: pick a service in the header dropdown, set a
+duration, and hit **Simulate Outage** to watch the failure cascade upstream.
+
+`SPIKE_INTERVAL_MS=3600000` parks the generator's own fault timer (default: a fault every 15 s) so
+that anything you see going red is attributable to your click. Drop it for background chaos.
+
 ## How it works
 
 Three processes. Telemetry flows one way; operator control flows back the other.
@@ -101,14 +128,18 @@ Regenerate explicitly with:
 
 ## Build and run
 
+See [Quick start](#quick-start) to get the whole thing running. Individual tasks:
+
 ```sh
-./gradlew build      # compile + test
-./gradlew test       # tests only
-./gradlew run        # start both servers
+./gradlew build        # compile + test
+./gradlew test         # tests only
+./gradlew run          # server only: gRPC :50051 + HTTP/WebSocket :8080
+./gradlew mockCluster  # generator only, against an already-running server
 ```
 
 - gRPC on `:50051` (server reflection enabled, so `grpcurl` works without `-proto`)
 - HTTP/WebSocket on `:8080`
+- dashboard on `:5173` via `cd frontend && npm run dev`
 
 ```sh
 curl localhost:8080/health         # {"status":"ok"}
@@ -385,10 +416,10 @@ The graph branches in both directions: `auth-service` fans **out** to two depend
 makes the blast radius reading meaningful rather than decorative. With breakers armed the database
 branch shows as an open circuit rather than going red.
 
+Started by [Quick start](#quick-start) above. The gRPC target is its one positional argument:
+
 ```sh
-./gradlew run                                  # terminal 1: the server
-./gradlew mockCluster                          # terminal 2: the load generator
-./gradlew mockCluster --args="localhost:50051" # explicit target
+./gradlew mockCluster --args="localhost:50051"
 ```
 
 Each service holds its own long-lived client-streaming RPC open and samples every 500 ms, the way a
