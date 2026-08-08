@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Background,
+  BaseEdge,
   Controls,
+  EdgeLabelRenderer,
+  getSmoothStepPath,
   Handle,
   MarkerType,
   MiniMap,
@@ -10,6 +13,8 @@ import {
   useEdgesState,
   useNodesState,
   type Edge,
+  type EdgeProps,
+  type EdgeTypes,
   type Node,
   type NodeProps,
   type NodeTypes,
@@ -23,8 +28,25 @@ const WS_URL = 'ws://localhost:8080/ws/metrics'
 const RECONNECT_DELAY_MS = 2000
 const OUTAGE_DURATION_MS = 15000
 
-const COLUMN_WIDTH = 260
-const ROW_HEIGHT = 140
+// Columns must clear the widest card (~215px for "notification-worker") with enough run
+// left over that a mid-path label badge cannot reach either handle.
+const COLUMN_WIDTH = 380
+// Siblings in a column (frontend-gateway / notification-worker, db-primary / redis-cache) need
+// enough vertical separation that their edge badges never land in the same band.
+const ROW_HEIGHT = 200
+
+const EDGE_STROKE_WIDTH = 2
+const EDGE_MARKER = { type: MarkerType.ArrowClosed, width: 20, height: 20 } as const
+
+/**
+ * Badges sit part-way along the path, toward the source, rather than at the 50% midpoint where
+ * several routes converge. Edges leaving the same node are staggered by LABEL_POSITION_STEP,
+ * because a fan-out's routes have not diverged yet near their shared source - at a flat 0.25 the
+ * two auth-service badges land 3px apart.
+ */
+const LABEL_POSITION_BASE = 0.35
+const LABEL_POSITION_STEP = 0.15
+const LABEL_POSITION_MAX = 0.8
 
 /* ------------------------------------------------------------------ payload */
 
@@ -122,6 +144,85 @@ const STATUS_COLOR: Record<Status, string> = {
   WARNING: '#f59e0b',
   CRITICAL: '#ef4444',
 }
+
+/** Shared by every edge; per-edge options below only add the error-rate colouring. */
+const defaultEdgeOptions = {
+  type: 'latency' as const,
+  markerEnd: EDGE_MARKER,
+  style: { strokeWidth: EDGE_STROKE_WIDTH },
+}
+
+/**
+ * Geometric point a given fraction along an SVG path. Uses a detached path element, which is
+ * exact for the rounded corners a smoothstep route produces; falls back to the caller's
+ * midpoint if the browser refuses to measure a detached node.
+ */
+function pointAlongPath(d: string, ratio: number): { x: number; y: number } | null {
+  if (typeof document === 'undefined') return null
+  try {
+    const probe = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+    probe.setAttribute('d', d)
+    const total = probe.getTotalLength()
+    if (!Number.isFinite(total) || total === 0) return null
+    const point = probe.getPointAtLength(total * ratio)
+    return { x: point.x, y: point.y }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Smoothstep edge whose latency badge is rendered as HTML at [LABEL_POSITION] along the route,
+ * instead of React Flow's default 50% midpoint - which is exactly where several edges converge.
+ */
+function LatencyEdge({
+  id,
+  sourceX,
+  sourceY,
+  sourcePosition,
+  targetX,
+  targetY,
+  targetPosition,
+  markerEnd,
+  style,
+  label,
+  data,
+}: EdgeProps) {
+  const [path, midX, midY] = getSmoothStepPath({
+    sourceX,
+    sourceY,
+    sourcePosition,
+    targetX,
+    targetY,
+    targetPosition,
+  })
+
+  const ratio = (data as { labelPosition?: number } | undefined)?.labelPosition
+    ?? LABEL_POSITION_BASE
+
+  const badge = useMemo(
+    () => pointAlongPath(path, ratio) ?? { x: midX, y: midY },
+    [path, ratio, midX, midY],
+  )
+
+  return (
+    <>
+      <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} />
+      {label != null && (
+        <EdgeLabelRenderer>
+          <div
+            className="edge-badge"
+            style={{ transform: `translate(-50%, -50%) translate(${badge.x}px, ${badge.y}px)` }}
+          >
+            {label}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  )
+}
+
+const edgeTypes: EdgeTypes = { latency: LatencyEdge }
 
 function edgeStroke(errorRate: number): string {
   if (errorRate > 0.15) return '#ef4444'
@@ -325,19 +426,30 @@ export default function App() {
         }))
       })
 
+      // Stagger badges across the edges leaving each node, so a fan-out never stacks them.
+      const outboundSeen = new Map<string, number>()
+
       setEdges(
-        incoming.edges.map((edge) => ({
-          id: `${edge.source}->${edge.target}`,
-          source: edge.source,
-          target: edge.target,
-          label: `${edge.avgLatencyMs.toFixed(0)} ms`,
-          animated: edge.avgErrorRate > 0.05,
-          markerEnd: { type: MarkerType.ArrowClosed, color: edgeStroke(edge.avgErrorRate) },
-          style: {
-            stroke: edgeStroke(edge.avgErrorRate),
-            strokeWidth: edge.avgErrorRate > 0.05 ? 2.5 : 1.5,
-          },
-        })),
+        incoming.edges.map((edge) => {
+          const stroke = edgeStroke(edge.avgErrorRate)
+          const index = outboundSeen.get(edge.source) ?? 0
+          outboundSeen.set(edge.source, index + 1)
+          return {
+            id: `${edge.source}->${edge.target}`,
+            source: edge.source,
+            target: edge.target,
+            label: `${edge.avgLatencyMs.toFixed(0)} ms`,
+            animated: edge.avgErrorRate > 0.05,
+            markerEnd: { ...EDGE_MARKER, color: stroke },
+            style: { stroke, strokeWidth: EDGE_STROKE_WIDTH },
+            data: {
+              labelPosition: Math.min(
+                LABEL_POSITION_BASE + index * LABEL_POSITION_STEP,
+                LABEL_POSITION_MAX,
+              ),
+            },
+          }
+        }),
       )
 
       setLastUpdate(new Date())
@@ -446,6 +558,8 @@ export default function App() {
           onNodeClick={(_, node) => setSelectedId(node.id)}
           onPaneClick={() => setSelectedId(null)}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          defaultEdgeOptions={defaultEdgeOptions}
           fitView
         >
           <Background gap={22} size={1} color="#1e293b" />
