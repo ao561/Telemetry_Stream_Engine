@@ -234,9 +234,8 @@ private class SpikeSchedule {
     }
 
     /**
-     * Extends an in-flight window without moving its start. Re-calling [begin] each poll would
-     * keep pushing startedAt forward, and `now >= startedAt + hopDelayMs` would then only ever
-     * hold for hop 0 - the error cascade would stop dead at the first hop.
+     * Extends an in-flight window without moving its start, so the schedule keeps describing one
+     * continuous outage rather than restarting on every control poll.
      */
     fun extendTo(end: Long) {
         if (end > endsAt) endsAt = end
