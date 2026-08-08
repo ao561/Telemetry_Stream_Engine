@@ -50,6 +50,9 @@ private const val RECONNECT_DELAY_MS = 2_000L
 private val CONTROL_URL = System.getenv("CONTROL_URL") ?: "http://localhost:8080/api/outage"
 private const val CONTROL_POLL_MS = 500L
 
+/** How many ticks of the cascade breakdown to print when an outage starts. */
+private const val BREAKDOWN_TICKS = 3
+
 /** Wire time on top of whatever the dependency itself takes. */
 private val NETWORK_JITTER_MS = 0.4..2.5
 private val JSON = Json { ignoreUnknownKeys = true }
@@ -160,6 +163,73 @@ private val DEPENDENCIES_OF: Map<String, List<String>> =
     CLUSTER.groupBy({ it.source }, { it.target })
 
 /**
+ * Services in bottom-up topological order: every service appears after all of its dependencies.
+ * A single pass in this order therefore lets a parent read the values its children were just
+ * assigned, so a leaf spike reaches the top of the graph within one tick.
+ */
+private val EVALUATION_ORDER: List<Service> = buildEvaluationOrder()
+
+private fun buildEvaluationOrder(): List<Service> {
+    val byId = SERVICES.associateBy { it.id }
+    val ordered = mutableListOf<Service>()
+    val settled = mutableSetOf<String>()
+    val onStack = mutableSetOf<String>()
+
+    fun visit(id: String) {
+        // The onStack guard breaks dependency cycles; the back edge is simply left unordered
+        // and falls back to the previous tick's value in tickServiceTimes.
+        if (id in settled || id in onStack) return
+        onStack += id
+        DEPENDENCIES_OF[id].orEmpty().forEach(::visit)
+        onStack -= id
+        if (settled.add(id)) byId[id]?.let(ordered::add)
+    }
+
+    SERVICES.forEach { visit(it.id) }
+    return ordered
+}
+
+/** One service's contribution to the cascade, for the audit log. */
+private class LatencyBreakdown(
+    val serviceId: String,
+    val internalMs: Double,
+    val maxChildMs: Double,
+    val totalMs: Double,
+)
+
+private fun ClosedFloatingPointRange<Double>.sample(): Double =
+    Random.nextDouble(start, endInclusive)
+
+/** Shared fault window. Written by one coroutine, read by all the streams. */
+private class SpikeSchedule {
+    @Volatile
+    private var startedAt = Long.MIN_VALUE
+
+    @Volatile
+    private var endsAt = Long.MIN_VALUE
+
+    fun begin(now: Long, durationMs: Long) {
+        startedAt = now
+        endsAt = now + durationMs
+    }
+
+    /**
+     * Extends an in-flight window without moving its start. Re-calling [begin] each poll would
+     * keep pushing startedAt forward, and `now >= startedAt + hopDelayMs` would then only ever
+     * hold for hop 0 - the error cascade would stop dead at the first hop.
+     */
+    fun extendTo(end: Long) {
+        if (end > endsAt) endsAt = end
+    }
+
+    /** A hop [hopDelayMs] above the fault both sees it later and recovers later. */
+    fun isDegraded(now: Long, hopDelayMs: Long): Boolean =
+        now >= startedAt + hopDelayMs && now < endsAt + hopDelayMs
+
+    fun isActive(now: Long): Boolean = now in startedAt until endsAt
+}
+
+/**
  * How long each service currently takes to serve a request, inclusive of downstream wait.
  * This is the only coupling between hops, and what turns a leaf fault into a real cascade.
  */
@@ -183,61 +253,63 @@ private class ClusterState {
  * Each pass reads the *previous* snapshot rather than values written during this pass, so a
  * change takes one sample interval to travel one hop instead of teleporting across the DAG.
  */
-private fun tickServiceTimes(cluster: ClusterState, spikes: SpikeSchedule) {
-    val now = System.currentTimeMillis()
+private fun tickServiceTimes(cluster: ClusterState, faulted: Boolean): List<LatencyBreakdown> {
     val previous = cluster.snapshot()
     val updated = HashMap<String, Double>(SERVICES.size)
+    val breakdown = ArrayList<LatencyBreakdown>(SERVICES.size)
 
-    for (service in SERVICES) {
-        val slowestDependency = DEPENDENCIES_OF[service.id]
+    for (service in EVALUATION_ORDER) {
+        // Bottom-up: every dependency has already been assigned in this same pass, so a parent
+        // sees its children's post-spike values immediately. `previous` only backstops an edge
+        // that a dependency cycle forced buildEvaluationOrder to leave unordered.
+        val maxChildMs = DEPENDENCIES_OF[service.id]
             .orEmpty()
-            .maxOfOrNull { previous[it] ?: 0.0 }
+            .maxOfOrNull { updated[it] ?: previous[it] ?: 0.0 }
             ?: 0.0
-        val faulted = service.faultedLocalMs?.takeIf { spikes.isActive(now) }
-        updated[service.id] = (faulted ?: service.localMs).sample() + slowestDependency
+
+        val profile = service.faultedLocalMs?.takeIf { faulted } ?: service.localMs
+        val internalMs = profile.sample()
+        val totalMs = internalMs + maxChildMs
+
+        updated[service.id] = totalMs
+        breakdown += LatencyBreakdown(service.id, internalMs, maxChildMs, totalMs)
     }
 
     cluster.publishAll(updated)
+    return breakdown
+}
+
+private fun printBreakdown(label: String, rows: List<LatencyBreakdown>) {
+    println("  ${LocalTime.now().format(TIME_FORMAT)}  latency breakdown - $label")
+    println("    %-20s %12s %14s %12s".format("service_id", "internal_ms", "max_child_ms", "total_ms"))
+    for (row in rows) {
+        println(
+            "    %-20s %12.1f %14.1f %12.1f".format(
+                row.serviceId, row.internalMs, row.maxChildMs, row.totalMs,
+            )
+        )
+    }
 }
 
 private suspend fun driveServiceTimes(cluster: ClusterState, spikes: SpikeSchedule) {
+    var wasFaulted = false
+    var ticksLeftToLog = 0
+
     while (currentCoroutineContext().isActive) {
-        tickServiceTimes(cluster, spikes)
+        val faulted = spikes.isActive(System.currentTimeMillis())
+        val breakdown = tickServiceTimes(cluster, faulted)
+
+        if (faulted && !wasFaulted) ticksLeftToLog = BREAKDOWN_TICKS
+        if (!faulted && wasFaulted) printBreakdown("recovered", breakdown)
+        if (ticksLeftToLog > 0) {
+            printBreakdown("outage tick ${BREAKDOWN_TICKS - ticksLeftToLog + 1}", breakdown)
+            ticksLeftToLog--
+        }
+
+        wasFaulted = faulted
         delay(SAMPLE_INTERVAL_MS)
     }
 }
-
-/** Shared fault window. Written by one coroutine, read by all the streams. */
-private class SpikeSchedule {
-    @Volatile
-    private var startedAt = Long.MIN_VALUE
-
-    @Volatile
-    private var endsAt = Long.MIN_VALUE
-
-    fun begin(now: Long, durationMs: Long) {
-        startedAt = now
-        endsAt = now + durationMs
-    }
-
-    /**
-     * Extends an in-flight window without moving its start. Re-calling [begin] each poll would
-     * keep pushing startedAt forward, and `now >= startedAt + hopDelayMs` would then only ever
-     * hold for hop 0 - the cascade would stop dead at the first hop.
-     */
-    fun extendTo(end: Long) {
-        if (end > endsAt) endsAt = end
-    }
-
-    /** A hop [hopDelayMs] above the fault both sees it later and recovers later. */
-    fun isDegraded(now: Long, hopDelayMs: Long): Boolean =
-        now >= startedAt + hopDelayMs && now < endsAt + hopDelayMs
-
-    fun isActive(now: Long): Boolean = now in startedAt until endsAt
-}
-
-private fun ClosedFloatingPointRange<Double>.sample(): Double =
-    Random.nextDouble(start, endInclusive)
 
 fun main(args: Array<String>) = runBlocking<Unit> {
     val target = args.firstOrNull() ?: DEFAULT_TARGET
@@ -246,10 +318,9 @@ fun main(args: Array<String>) = runBlocking<Unit> {
     val spikes = SpikeSchedule()
     val cluster = ClusterState()
 
-    // Seed the DAG from the leaves outward, so the first samples carry steady-state values
-    // instead of zeros for services whose dependencies have not reported yet. One pass per
-    // possible hop is enough for the values to reach the top of the graph.
-    repeat(SERVICES.size) { tickServiceTimes(cluster, spikes) }
+    // One bottom-up pass seeds the whole graph, since each service is evaluated after its
+    // dependencies - so the first metrics carry steady-state values rather than zeros.
+    tickServiceTimes(cluster, faulted = false)
 
     println("streaming synthetic cluster telemetry to $target")
     CLUSTER.forEach { println("  ${it.source} -> ${it.target}") }
